@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Conda
+.conda/
+conda-meta/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Model checkpoints
+checkpoints/
+*.pth
+*.pt
+*.onnx
+
+# Datasets
+data/
+
+# Generated outputs
+results/videos/
+output_result.mp4
+
+# Python cache
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Temporary files
+*.tmp
+*.temp
+
+#sample videos
+sample_videos_for_testing/
+
+#results
+results/
+
+Violence_detection/
+eval_results_old_v1.csv
+eval_results.csv
+_init_.py
