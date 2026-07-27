@@ -8,15 +8,17 @@ import cv2
 import numpy as np
 
 from action_math import detect_advanced_violence, extract_keypoint
+from behavior_helpers import should_flag_violence, update_track_state
 from vision_models import create_pose_pipeline, match_keypoints_to_bbox
 from x3d_adapter import X3DViolenceDetector, ClipBuffer
 import supervision as sv
 
 HISTORY_LENGTH = 15
-PROXIMITY_THRESHOLD = 500.0
+PROXIMITY_THRESHOLD = 500
 RESULTS_CSV = "eval_results.csv"
-BATCH_SIZE = 25          # clips per batch before pausing
-COOLDOWN_SECONDS = 60    # pause between batches to let temps drop
+BATCH_SIZE = 25
+COOLDOWN_SECONDS = 60
+POSE_DETECTION_CONFIDENCE = 0.35
 
 KP_NOSE = 0
 KP_LEFT_SHOULDER = 5
@@ -25,6 +27,8 @@ KP_LEFT_HIP = 11
 KP_RIGHT_HIP = 12
 KP_LEFT_WRIST = 9
 KP_RIGHT_WRIST = 10
+KP_LEFT_ELBOW = 7
+KP_RIGHT_ELBOW = 8
 
 TEST_DIRS = {
     "Fight": "./data/RWF-2000/val/Fight",
@@ -36,6 +40,8 @@ def update_person_state(tracker_id, keypoints, state):
     head = extract_keypoint(keypoints, KP_NOSE)
     wr = extract_keypoint(keypoints, KP_RIGHT_WRIST)
     wl = extract_keypoint(keypoints, KP_LEFT_WRIST)
+    er = extract_keypoint(keypoints, KP_RIGHT_ELBOW)
+    el = extract_keypoint(keypoints, KP_LEFT_ELBOW)
     sl = extract_keypoint(keypoints, KP_LEFT_SHOULDER)
     sr = extract_keypoint(keypoints, KP_RIGHT_SHOULDER)
     hl = extract_keypoint(keypoints, KP_LEFT_HIP)
@@ -44,6 +50,8 @@ def update_person_state(tracker_id, keypoints, state):
     state['head'].append(head if head else (0.0, 0.0))
     state['wrist_R'].append(wr if wr else (0.0, 0.0))
     state['wrist_L'].append(wl if wl else (0.0, 0.0))
+    state['elbow_R'].append(er if er else (0.0, 0.0))
+    state['elbow_L'].append(el if el else (0.0, 0.0))
     state['shoulder_L'].append(sl if sl else (0.0, 0.0))
     state['shoulder_R'].append(sr if sr else (0.0, 0.0))
     state['hip_L'].append(hl if hl else (0.0, 0.0))
@@ -58,8 +66,8 @@ def update_person_state(tracker_id, keypoints, state):
 
 def run_heuristic_and_x3d_on_clip(video_path, pose_model, x3d_detector):
     byte_tracker = sv.ByteTrack(
-        track_activation_threshold=0.25,
-        lost_track_buffer=30,
+        track_activation_threshold=0.55,
+        lost_track_buffer=10,
         minimum_matching_threshold=0.8,
         frame_rate=30,
     )
@@ -70,6 +78,8 @@ def run_heuristic_and_x3d_on_clip(video_path, pose_model, x3d_detector):
     person_states = defaultdict(lambda: {
         'wrist_R': deque(maxlen=HISTORY_LENGTH),
         'wrist_L': deque(maxlen=HISTORY_LENGTH),
+        'elbow_R': deque(maxlen=HISTORY_LENGTH),
+        'elbow_L': deque(maxlen=HISTORY_LENGTH),
         'head': deque(maxlen=HISTORY_LENGTH),
         'shoulder_L': deque(maxlen=HISTORY_LENGTH),
         'shoulder_R': deque(maxlen=HISTORY_LENGTH),
@@ -82,13 +92,14 @@ def run_heuristic_and_x3d_on_clip(video_path, pose_model, x3d_detector):
 
     heuristic_flagged = False
     clip_buffer = ClipBuffer(maxlen=32)
+    track_states = {}
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        pose_results = pose_model.predict(frame, confidence=0.5)
+        pose_results = pose_model.predict(frame, confidence=POSE_DETECTION_CONFIDENCE, det_thr=POSE_DETECTION_CONFIDENCE)
         detections = pose_results.to_supervision()
         tracked = byte_tracker.update_with_detections(detections)
 
@@ -96,14 +107,18 @@ def run_heuristic_and_x3d_on_clip(video_path, pose_model, x3d_detector):
         for idx in range(len(tracked)):
             tracker_id = int(tracked.tracker_id[idx])
             active_ids.add(tracker_id)
+            track_state = track_states.setdefault(tracker_id, {})
             bbox = tracked.xyxy[idx]
+            confidence_value = float(tracked.confidence[idx]) if tracked.confidence is not None else 0.0
+            smoothed_bbox, _, _ = update_track_state(track_state, bbox, confidence_value)
+            tracked.xyxy[idx] = smoothed_bbox
 
-            width = max(1e-5, bbox[2] - bbox[0])
-            height = max(1e-5, bbox[3] - bbox[1])
+            width = max(1e-5, smoothed_bbox[2] - smoothed_bbox[0])
+            height = max(1e-5, smoothed_bbox[3] - smoothed_bbox[1])
             person_states[tracker_id]['bbox_ar'] = width / height
             person_states[tracker_id]['bbox_height'] = height
 
-            kps = match_keypoints_to_bbox(pose_results, bbox)
+            kps = match_keypoints_to_bbox(pose_results, smoothed_bbox)
             if kps is not None:
                 update_person_state(tracker_id, kps, person_states[tracker_id])
 
@@ -121,11 +136,17 @@ def run_heuristic_and_x3d_on_clip(video_path, pose_model, x3d_detector):
                     hist_a = {k: list(v) for k, v in person_states[ids[i]].items() if isinstance(v, deque)}
                     hist_b = {k: list(v) for k, v in person_states[ids[j]].items() if isinstance(v, deque)}
 
-                    v_a_b, _ = detect_advanced_violence(hist_a, hist_b,  person_states[ids[i]]['bbox_height'])
-                    v_b_a, _ = detect_advanced_violence(hist_b, hist_a,   person_states[ids[j]]['bbox_height'])
+                    v_a_b, telem_a_b = detect_advanced_violence(hist_a, hist_b, person_states[ids[i]]['bbox_height'])
+                    v_b_a, telem_b_a = detect_advanced_violence(hist_b, hist_a, person_states[ids[j]]['bbox_height'])
 
-                    if v_a_b or v_b_a:
-                        heuristic_flagged = True
+                    telemetry = {
+                        'score': max(telem_a_b['score'], telem_b_a['score']),
+                        'relative_velocity': max(telem_a_b['relative_velocity'], telem_b_a['relative_velocity']),
+                        'relative_acceleration': max(telem_a_b['relative_acceleration'], telem_b_a['relative_acceleration']),
+                        'entropy': max(telem_a_b['entropy'], telem_b_a['entropy']),
+                        'distance_norm': dist / max(person_states[ids[i]]['bbox_height'], 1e-5),
+                    }
+                    heuristic_flagged = should_flag_violence(telemetry, person_states[ids[i]], person_states[ids[j]]) or (v_a_b and v_b_a)
 
         clip_buffer.add(frame)
 

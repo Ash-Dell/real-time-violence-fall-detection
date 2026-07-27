@@ -1,9 +1,9 @@
 """
-action_math.py — Advanced Kinematics Module for Violence Detection
+action_math.py — Kinematics Module for Violence Detection
 
-Implements 3rd-order kinematic analysis (Jerk) and vector alignment
-(momentum transfer via dot product) to distinguish genuine violent
-impacts from periodic exercise motions like jumping jacks.
+Implements 3rd-order kinematic analysis (Jerk) combined with an
+approach-vector / contact-distance check to distinguish a genuine
+strike from incidental fast motion (e.g. jumping jacks, waving).
 """
 
 import numpy as np
@@ -11,10 +11,13 @@ from typing import List, Tuple, Optional, Dict
 
 
 # ============================================================
-# CONFIGURABLE THRESHOLDS
+# CONFIGURABLE THRESHOLDS — all four of these are first-pass
+# estimates and need empirical tuning against the eval set,
+# same as the original JERK_THRESHOLD_NORM was flagged before.
 # ============================================================
-JERK_THRESHOLD_NORM = 0.6  # scale-invariant jerk threshold (fraction of bbox_height per frame^3) — needs tuning
-MOMENTUM_TRANSFER_THRESHOLD = 0.05
+JERK_THRESHOLD_NORM = 0.6          # scale-invariant jerk threshold (fraction of bbox_height per frame^3)
+ALIGNMENT_THRESHOLD = 0.05         # min cosine similarity between limb velocity and approach direction
+CONTACT_THRESHOLD_NORM = 0.7       # max limb-to-target distance (fraction of bbox_height) to count as "in range"
 MIN_HISTORY_FRAMES = 5
 DEFAULT_EMA_ALPHA = 0.5
 
@@ -45,6 +48,16 @@ def calculate_kinematics(
     positions: List[Tuple[float, float]],
     dt: float = 1.0
 ) -> Optional[Dict]:
+    """
+    NOTE: dt currently defaults to 1.0 (per-frame). This means jerk
+    thresholds are effectively tuned against whatever frame rate the
+    eval script processes at. If live inference runs at a different
+    effective FPS than eval (dropped frames, slower hardware), the same
+    real-world motion will produce a different apparent jerk value.
+    The correct long-term fix is to thread real elapsed wall-clock time
+    through from the capture loop into this dt parameter — flagging
+    this here rather than silently leaving it as an unstated assumption.
+    """
     if len(positions) < 4:
         return None
     pos = np.array(positions, dtype=np.float64)
@@ -63,84 +76,129 @@ def calculate_kinematics(
 
 
 # ============================================================
-# VIOLENCE DETECTION: Jerk + Momentum Transfer (scale-invariant)
+# TARGET SELECTION: where on person B are we checking for contact?
+# ============================================================
+def _get_target_point(
+    history_B: Dict[str, List[Tuple[float, float]]]
+) -> Optional[Tuple[float, float]]:
+    """
+    Best-effort location on person B to treat as the 'target'.
+    Prefers head; falls back to shoulder midpoint, then hip midpoint,
+    since the head is often exactly what gets occluded during a
+    scuffle (arms/hands covering the face).
+    """
+    head = history_B.get('head', [])
+    if head and head[-1] != (0.0, 0.0):
+        return head[-1]
+
+    sl = history_B.get('shoulder_L', [])
+    sr = history_B.get('shoulder_R', [])
+    if sl and sr and sl[-1] != (0.0, 0.0) and sr[-1] != (0.0, 0.0):
+        return ((sl[-1][0] + sr[-1][0]) / 2.0, (sl[-1][1] + sr[-1][1]) / 2.0)
+
+    hl = history_B.get('hip_L', [])
+    hr = history_B.get('hip_R', [])
+    if hl and hr and hl[-1] != (0.0, 0.0) and hr[-1] != (0.0, 0.0):
+        return ((hl[-1][0] + hr[-1][0]) / 2.0, (hl[-1][1] + hr[-1][1]) / 2.0)
+
+    return None
+
+
+# ============================================================
+# VIOLENCE DETECTION: Jerk + Approach Vector + Contact Distance
 # ============================================================
 def detect_advanced_violence(
     history_A: Dict[str, List[Tuple[float, float]]],
     history_B: Dict[str, List[Tuple[float, float]]],
     bbox_height: float,
     jerk_threshold: float = JERK_THRESHOLD_NORM,
-    momentum_threshold: float = MOMENTUM_TRANSFER_THRESHOLD,
-    alpha: float = DEFAULT_EMA_ALPHA
+    alignment_threshold: float = ALIGNMENT_THRESHOLD,
+    contact_threshold_norm: float = CONTACT_THRESHOLD_NORM,
+    alpha: float = DEFAULT_EMA_ALPHA,
 ) -> Tuple[bool, Dict[str, float]]:
     """
-    Determines if Person A is striking Person B. Jerk is now normalized
-    by bbox_height so detection works consistently regardless of subject
-    distance from camera (matches detect_fall()'s scale-invariant approach).
+    Is a limb of person A striking person B?
+
+    Redesigned from the original: instead of comparing the attacker's
+    wrist velocity to person B's OWN head velocity (which is near-zero,
+    and therefore gates the whole check off, whenever the victim is
+    still or only reacting), this checks the wrist's velocity against
+    the direction FROM the wrist TO person B's nearest landmark, and
+    additionally requires the wrist to actually be within striking
+    range of that landmark. That's the real physical signature of a
+    strike: a limb accelerating toward a target that's close enough to
+    hit — independent of what the target's own body happens to be doing.
+
+    Three conditions must all hold for a given wrist:
+      1. peak jerk over the recent window exceeds jerk_threshold (a sharp,
+         non-smooth motion — distinguishes a strike from a steady swing)
+      2. the wrist's velocity is meaningfully aligned with the direction
+         toward the target (alignment_threshold)
+      3. the wrist is within contact_threshold_norm of the target when
+         this happens (rules out a fast hand moving toward a distant,
+         unrelated person)
     """
-    _null_telem: Dict[str, float] = {'jerk': 0.0, 'alignment': 0.0}
+    _null_telem: Dict[str, float] = {'jerk': 0.0, 'alignment': 0.0, 'distance_norm': 999.0}
 
-    head_history_B = history_B.get('head', [])
-    if len(head_history_B) < MIN_HISTORY_FRAMES:
+    target_point = _get_target_point(history_B)
+    if target_point is None:
         return False, _null_telem
-
-    head_history_B = _fill_missing(head_history_B)
-    smoothed_head_B = smooth_keypoints(head_history_B, alpha)
-    kin_head_B = calculate_kinematics(smoothed_head_B)
-    if kin_head_B is None:
-        return False, _null_telem
-
-    head_vel = kin_head_B['velocity_vectors'][-1]
 
     best_jerk = 0.0
-    best_cos_sim = 0.0
+    best_alignment = 0.0
+    best_distance_norm = 999.0
     is_violence = False
 
-    for wrist_key in ['wrist_R', 'wrist_L']:
+    for wrist_key in ('wrist_R', 'wrist_L'):
         wrist_history_A = history_A.get(wrist_key, [])
         if len(wrist_history_A) < MIN_HISTORY_FRAMES:
             continue
 
-        wrist_history_A = _fill_missing(wrist_history_A)
-        smoothed_wrist_A = smooth_keypoints(wrist_history_A, alpha)
-        kin_wrist_A = calculate_kinematics(smoothed_wrist_A)
-
-        if kin_wrist_A is None:
+        filled = _fill_missing(wrist_history_A)
+        smoothed = smooth_keypoints(filled, alpha)
+        kin = calculate_kinematics(smoothed)
+        if kin is None:
             continue
 
-        recent_jerk = kin_wrist_A['jerk_mag'][-3:]
-        peak_jerk_raw = float(np.max(recent_jerk)) if len(recent_jerk) > 0 else 0.0
-        peak_jerk = peak_jerk_raw / max(bbox_height, 1e-5)  # scale-invariant
-        wrist_vel = kin_wrist_A['velocity_vectors'][-1]
+        wrist_pos = np.array(smoothed[-1], dtype=np.float64)
+        wrist_vel = kin['velocity_vectors'][-1]
 
-        cos_sim = _cosine_similarity(wrist_vel, head_vel)
+        to_target = np.array(target_point, dtype=np.float64) - wrist_pos
+        distance_norm = float(np.linalg.norm(to_target)) / max(bbox_height, 1e-5)
+
+        recent_jerk = kin['jerk_mag'][-3:]
+        peak_jerk_raw = float(np.max(recent_jerk)) if len(recent_jerk) > 0 else 0.0
+        peak_jerk = peak_jerk_raw / max(bbox_height, 1e-5)
+
+        alignment = _cosine_similarity(wrist_vel, to_target)
 
         if peak_jerk > best_jerk:
             best_jerk = peak_jerk
-            best_cos_sim = cos_sim
+            best_alignment = alignment
+            best_distance_norm = distance_norm
 
-        if peak_jerk > jerk_threshold * 1.5 and cos_sim > 0.0:
-            is_violence = True
-        elif peak_jerk >= jerk_threshold and cos_sim >= momentum_threshold:
+        within_range = distance_norm < contact_threshold_norm
+        approaching = alignment > alignment_threshold
+
+        if within_range and approaching and peak_jerk >= jerk_threshold:
             is_violence = True
 
     telemetry: Dict[str, float] = {
         'jerk': best_jerk,
-        'alignment': best_cos_sim,
+        'alignment': best_alignment,
+        'distance_norm': best_distance_norm,
     }
-
     return is_violence, telemetry
 
 
 # ============================================================
-# FALL DETECTION (Robust CV Heuristic) — with debounce to reduce
-# false positives from fast-but-brief head movements
+# FALL DETECTION (unchanged — not flagged as broken)
 # ============================================================
 def detect_fall(
     history: Dict[str, List[Tuple[float, float]]],
     bbox_width: float,
     bbox_height: float,
-    velocity_threshold_norm: float = 0.08,   # raised from 0.05 to reduce false triggers on quick head bobs
+    velocity_threshold_norm: float = 0.08,
     crumple_threshold_norm: float = 0.25
 ) -> Tuple[bool, Dict[str, float]]:
     _null_telem: Dict[str, float] = {'dy_norm': 0.0, 'ar': 0.0, 'crumple': 0.0}
@@ -191,16 +249,62 @@ def detect_fall(
 def _fill_missing(
     history: List[Tuple[float, float]]
 ) -> List[Tuple[float, float]]:
-    if not history:
+    """
+    Fill gaps left by low-confidence keypoints (encoded upstream as the
+    (0.0, 0.0) sentinel) via linear interpolation between the nearest
+    valid points on either side of the gap.
+
+    The previous version repeated the last valid point forward through
+    the whole gap — which flattens velocity to zero for the gap's
+    duration and then produces an artificial one-frame velocity/jerk
+    spike the instant tracking recovers. That's backwards for this use
+    case: fast motion (a punch, a shove) is exactly when pose confidence
+    tends to dip from motion blur. Interpolating instead approximates
+    the real, continuous motion through the gap.
+
+    Leading/trailing gaps (no valid point on one side) fall back to the
+    nearest available valid value, since there's nothing to interpolate
+    from.
+    """
+    n = len(history)
+    if n == 0:
         return history
-    cleaned = [history[0]]
-    for i in range(1, len(history)):
-        x, y = history[i]
-        if x == 0.0 and y == 0.0:
-            cleaned.append(cleaned[i - 1])
-        else:
-            cleaned.append((x, y))
-    return cleaned
+
+    is_valid = [not (p[0] == 0.0 and p[1] == 0.0) for p in history]
+    if not any(is_valid):
+        return list(history)
+
+    filled: List[Tuple[float, float]] = list(history)
+
+    i = 0
+    while i < n:
+        if is_valid[i]:
+            i += 1
+            continue
+
+        gap_start = i
+        while i < n and not is_valid[i]:
+            i += 1
+        gap_end = i  # first valid index after the gap, or n
+
+        left_val = filled[gap_start - 1] if gap_start > 0 else None
+        right_val = filled[gap_end] if gap_end < n else None
+
+        if left_val is not None and right_val is not None:
+            span = gap_end - (gap_start - 1)
+            for k in range(gap_start, gap_end):
+                t = (k - (gap_start - 1)) / span
+                x = left_val[0] + (right_val[0] - left_val[0]) * t
+                y = left_val[1] + (right_val[1] - left_val[1]) * t
+                filled[k] = (x, y)
+        elif left_val is not None:
+            for k in range(gap_start, gap_end):
+                filled[k] = left_val
+        elif right_val is not None:
+            for k in range(gap_start, gap_end):
+                filled[k] = right_val
+
+    return filled
 
 
 def _cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:

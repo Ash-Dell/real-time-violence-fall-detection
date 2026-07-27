@@ -56,7 +56,6 @@ sample_videos_for_testing/
 #results
 results/
 
-Violence_detection/
 eval_results_old_v1.csv
 eval_results.csv
-_init_.py
+__init__.py

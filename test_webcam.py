@@ -11,6 +11,7 @@ from action_math import (
     detect_fall,
     extract_keypoint,
 )
+from behavior_helpers import mark_track_lost, should_flag_violence, update_track_state
 from vision_models import (
     create_pose_pipeline,
     match_keypoints_to_bbox,
@@ -19,9 +20,11 @@ from x3d_adapter import X3DViolenceDetector, ClipBuffer
 
 # Constants
 HISTORY_LENGTH = 15
-PROXIMITY_THRESHOLD = 500.0
+PROXIMITY_THRESHOLD = 500
 X3D_MIN_PEOPLE = 2
 X3D_CLIP_LEN = 32  # frames buffered before running X3D
+MOTION_THRESHOLD = 6.0
+POSE_DETECTION_CONFIDENCE = 0.35
 
 KP_NOSE = 0
 KP_LEFT_SHOULDER = 5
@@ -30,12 +33,16 @@ KP_LEFT_HIP = 11
 KP_RIGHT_HIP = 12
 KP_LEFT_WRIST = 9
 KP_RIGHT_WRIST = 10
+KP_LEFT_ELBOW = 7
+KP_RIGHT_ELBOW = 8
 
 
 def update_person_state(tracker_id: int, keypoints: np.ndarray, state: dict):
     head = extract_keypoint(keypoints, KP_NOSE)
     wr = extract_keypoint(keypoints, KP_RIGHT_WRIST)
     wl = extract_keypoint(keypoints, KP_LEFT_WRIST)
+    er = extract_keypoint(keypoints, KP_RIGHT_ELBOW)
+    el = extract_keypoint(keypoints, KP_LEFT_ELBOW)
     sl = extract_keypoint(keypoints, KP_LEFT_SHOULDER)
     sr = extract_keypoint(keypoints, KP_RIGHT_SHOULDER)
     hl = extract_keypoint(keypoints, KP_LEFT_HIP)
@@ -44,6 +51,8 @@ def update_person_state(tracker_id: int, keypoints: np.ndarray, state: dict):
     state['head'].append(head if head else (0.0, 0.0))
     state['wrist_R'].append(wr if wr else (0.0, 0.0))
     state['wrist_L'].append(wl if wl else (0.0, 0.0))
+    state['elbow_R'].append(er if er else (0.0, 0.0))
+    state['elbow_L'].append(el if el else (0.0, 0.0))
     state['shoulder_L'].append(sl if sl else (0.0, 0.0))
     state['shoulder_R'].append(sr if sr else (0.0, 0.0))
     state['hip_L'].append(hl if hl else (0.0, 0.0))
@@ -74,6 +83,31 @@ def check_proximity_trigger(person_states: dict) -> bool:
             if dist < PROXIMITY_THRESHOLD:
                 return True
     return False
+
+
+def check_motion_intensity(person_states: dict) -> bool:
+    """
+    Returns True if there's significant motion among tracked people.
+    This adds an additional gate to ensure X3D only runs when people
+    are actually moving (not just standing close together).
+    """
+    if len(person_states) < X3D_MIN_PEOPLE:
+        return False
+    
+    total_motion = 0.0
+    for tracker_id, state in person_states.items():
+        # Check wrist motion as indicator of overall body movement
+        wrist_r = list(state.get('wrist_R', deque(maxlen=HISTORY_LENGTH)))
+        wrist_l = list(state.get('wrist_L', deque(maxlen=HISTORY_LENGTH)))
+        
+        if len(wrist_r) >= 2 and len(wrist_l) >= 2:
+            # Calculate motion from recent frames
+            motion_r = np.linalg.norm(np.array(wrist_r[-1]) - np.array(wrist_r[-2]))
+            motion_l = np.linalg.norm(np.array(wrist_l[-1]) - np.array(wrist_l[-2]))
+            total_motion += motion_r + motion_l
+    
+    avg_motion = total_motion / len(person_states) if person_states else 0
+    return avg_motion > MOTION_THRESHOLD
 
 COCO_SKELETON = [
     (5, 7), (7, 9), (6, 8), (8, 10),      # arms
@@ -107,8 +141,8 @@ def main():
 
     print("[*] Initializing ByteTrack...")
     byte_tracker = sv.ByteTrack(
-        track_activation_threshold=0.25,
-        lost_track_buffer=30,
+        track_activation_threshold=0.55,
+        lost_track_buffer=10,
         minimum_matching_threshold=0.8,
         frame_rate=30,
     )
@@ -125,6 +159,8 @@ def main():
     person_states = defaultdict(lambda: {
         'wrist_R': deque(maxlen=HISTORY_LENGTH),
         'wrist_L': deque(maxlen=HISTORY_LENGTH),
+        'elbow_R': deque(maxlen=HISTORY_LENGTH),
+        'elbow_L': deque(maxlen=HISTORY_LENGTH),
         'head': deque(maxlen=HISTORY_LENGTH),
         'shoulder_L': deque(maxlen=HISTORY_LENGTH),
         'shoulder_R': deque(maxlen=HISTORY_LENGTH),
@@ -136,10 +172,14 @@ def main():
         'is_fallen': False,
         'bbox_ar': 1.0,
         'bbox_height': 1.0,
+        'violence_streak': 0,
+        'bbox_history': deque(maxlen=5),  # For bounding box smoothing
     })
 
     x3d_label = "N/A"
     x3d_confidence = 0.0
+    x3d_confidence_history = deque(maxlen=5)  # For confidence smoothing
+    track_states = {}
 
     print("[*] Starting Live Camera Feed. Press 'q' to quit.")
 
@@ -151,7 +191,7 @@ def main():
 
         frame = cv2.flip(frame, 1)
 
-        pose_results = pose_model.predict(frame, confidence=0.5)
+        pose_results = pose_model.predict(frame, confidence=POSE_DETECTION_CONFIDENCE, det_thr=POSE_DETECTION_CONFIDENCE)
         detections = pose_results.to_supervision()
 
         tracked = byte_tracker.update_with_detections(detections)
@@ -164,15 +204,22 @@ def main():
         for idx in range(len(tracked)):
             tracker_id = int(tracked.tracker_id[idx])
             active_tracker_ids.add(tracker_id)
+            track_state = track_states.setdefault(tracker_id, {})
 
             tracked_bbox = tracked.xyxy[idx]
+            confidence_value = float(tracked.confidence[idx]) if tracked.confidence is not None else 0.0
+            smoothed_bbox, track_confidence, _ = update_track_state(track_state, tracked_bbox, confidence_value)
+            tracked.xyxy[idx] = smoothed_bbox
+            person_states[tracker_id]['track_confidence'] = track_confidence
 
-            width = max(1e-5, tracked_bbox[2] - tracked_bbox[0])
-            height = max(1e-5, tracked_bbox[3] - tracked_bbox[1])
+            width = max(1e-5, smoothed_bbox[2] - smoothed_bbox[0])
+            height = max(1e-5, smoothed_bbox[3] - smoothed_bbox[1])
             person_states[tracker_id]['bbox_ar'] = width / height
             person_states[tracker_id]['bbox_height'] = height
 
-            kps = match_keypoints_to_bbox(pose_results, tracked_bbox)
+            person_states[tracker_id]['bbox_history'].append(smoothed_bbox)
+
+            kps = match_keypoints_to_bbox(pose_results, smoothed_bbox)
             if kps is not None:
                 update_person_state(tracker_id, kps, person_states[tracker_id])
                 draw_keypoints(frame, kps)
@@ -208,12 +255,16 @@ def main():
                 'crumple': t_fall['crumple'],
                 'is_fall': person_states[tracker_id]['is_fallen']
             }
-            if person_states[tracker_id]['is_fallen']:
-                red_boxes.add(tracker_id)
 
-        stale_ids = [tid for tid in person_states if tid not in active_tracker_ids]
+        stale_ids = [tid for tid in list(person_states.keys()) if tid not in active_tracker_ids]
         for tid in stale_ids:
-            del person_states[tid]
+            state = track_states.get(tid)
+            if state is None:
+                del person_states[tid]
+                continue
+            if not mark_track_lost(state):
+                del person_states[tid]
+                track_states.pop(tid, None)
 
         tracked_ids = list(person_states.keys())
         for i in range(len(tracked_ids)):
@@ -232,28 +283,54 @@ def main():
                     v_a_b, telem_a_b = detect_advanced_violence(hist_a, hist_b, person_states[id_a]['bbox_height'])
                     v_b_a, telem_b_a = detect_advanced_violence(hist_b, hist_a, person_states[id_b]['bbox_height'])
 
-                    is_violence = v_a_b or v_b_a
+                    telemetry = {
+                        'score': max(telem_a_b['score'], telem_b_a['score']),
+                        'relative_velocity': max(telem_a_b['relative_velocity'], telem_b_a['relative_velocity']),
+                        'relative_acceleration': max(telem_a_b['relative_acceleration'], telem_b_a['relative_acceleration']),
+                        'entropy': max(telem_a_b['entropy'], telem_b_a['entropy']),
+                        'distance_norm': np.sqrt((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2) / max(person_states[id_a]['bbox_height'], 1e-5),
+                    }
+                    is_violence = should_flag_violence(telemetry, person_states[id_a], person_states[id_b]) or (v_a_b and v_b_a)
                     if is_violence:
-                        red_boxes.update([id_a, id_b])
+                        person_states[id_a]['violence_streak'] += 1
+                        person_states[id_b]['violence_streak'] += 1
+                    else:
+                        person_states[id_a]['violence_streak'] = max(0, person_states[id_a]['violence_streak'] - 1)
+                        person_states[id_b]['violence_streak'] = max(0, person_states[id_b]['violence_streak'] - 1)
 
                     violence_telemetry[(id_a, id_b)] = {
                         'jerk': max(telem_a_b['jerk'], telem_b_a['jerk']),
                         'alignment': max(telem_a_b['alignment'], telem_b_a['alignment']),
+                        'score': telemetry['score'],
                         'is_violence': is_violence
                     }
 
         # ---------------------------------------------------------
-        # X3D gating: only buffer + run X3D when 2+ people are close
+        # X3D gating: only buffer + run X3D when 2+ people are close AND moving
         # ---------------------------------------------------------
         trigger_active = check_proximity_trigger(person_states)
-        if trigger_active:
+        motion_active = check_motion_intensity(person_states)
+        
+        if trigger_active and motion_active:
             clip_buffer.add(frame)
             if clip_buffer.is_ready(min_frames=13):
-                x3d_label, x3d_confidence = x3d_detector.predict(clip_buffer.get_clip())
+                new_label, new_confidence = x3d_detector.predict(clip_buffer.get_clip())
+                
+                # Confidence smoothing: average with recent predictions
+                if new_label != "N/A":
+                    x3d_confidence_history.append(new_confidence)
+                    smoothed_confidence = sum(x3d_confidence_history) / len(x3d_confidence_history)
+                    x3d_label = new_label
+                    x3d_confidence = smoothed_confidence
+                else:
+                    x3d_label = new_label
+                    x3d_confidence = new_confidence
+                    x3d_confidence_history.clear()
         else:
-            # Not enough people/proximity — don't waste compute, reset buffer
+            # Not enough people/proximity/motion — don't waste compute, reset buffer
             clip_buffer = ClipBuffer(maxlen=X3D_CLIP_LEN)
             x3d_label, x3d_confidence = "N/A", 0.0
+            x3d_confidence_history.clear()
 
         # Visual Annotation Overlay
         headcount = len(tracked)
@@ -264,27 +341,24 @@ def main():
         cv2.putText(frame, f"X3D: {x3d_label} ({x3d_confidence:.2f})", (20, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, x3d_color, 2)
 
-        x3d_flagging_violence = (x3d_label == "Fight" and x3d_confidence >= 0.6)
+        x3d_flagging_violence = (x3d_label == "Fight" and x3d_confidence >= 0.25)  # Lowered threshold for higher sensitivity
 
         for idx in range(len(tracked)):
             tid = int(tracked.tracker_id[idx])
             x1, y1, x2, y2 = map(int, tracked.xyxy[idx])
 
             label = "Normal"
-            f_telem = fall_telemetry.get(tid)
-            if f_telem and f_telem['is_fall']:
-                label = "MEDICAL EMERGENCY"
-            elif x3d_flagging_violence and tid in person_states:
+            if x3d_flagging_violence and tid in person_states:
                 # X3D is the primary violence signal now — if it fired,
                 # mark everyone currently in the triggering proximity group.
                 label = "Violence! (X3D)"
                 red_boxes.add(tid)
             else:
-                # Heuristic still computed for reference/telemetry display,
-                # but no longer drives the label/box color on its own.
+                # Re-enable heuristic with high-confidence gating as secondary system
                 for pair, v_telem in violence_telemetry.items():
-                    if tid in pair and v_telem['is_violence']:
-                        label = "Violence? (heuristic only)"
+                    if tid in pair and v_telem['is_violence'] and v_telem.get('score', 0) >= 3.0:
+                        label = "Violence? (heuristic high-conf)"
+                        red_boxes.add(tid)
                         break
 
             color = (0, 0, 255) if tid in red_boxes else (0, 255, 0)
@@ -293,10 +367,7 @@ def main():
             cv2.putText(frame, label, (x1, max(0, y1 - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            if f_telem:
-                text = f"Drop: {f_telem['dy_norm']:.2f} | AR: {f_telem['ar']:.1f} | Crump: {f_telem['crumple']:.2f}"
-                cv2.putText(frame, text, (x1, y2 + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+          
 
         for pair, v_telem in violence_telemetry.items():
             id_a, id_b = pair

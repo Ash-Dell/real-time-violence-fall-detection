@@ -1,4 +1,5 @@
 import os
+import cv2
 import torch
 import torch.nn as nn
 import numpy as np
@@ -58,36 +59,92 @@ class X3DViolenceDetector:
             raise ValueError("Need at least a few frames to run X3D inference.")
 
         # BGR -> RGB, stack into (T, H, W, C) -> tensor (C, T, H, W)
-        rgb_frames = [f[:, :, ::-1].copy() for f in frames]
-        clip = np.stack(rgb_frames, axis=0)  # (T, H, W, C)
+        rgb_frames = []
+
+        for f in frames:
+            rgb = f[:, :, ::-1]
+
+            rgb = cv2.resize(
+                rgb,
+                (320, 320)
+            )
+
+            rgb_frames.append(rgb)
+
+        clip = np.stack(rgb_frames, axis=0)
+
+
+
+
         clip_tensor = torch.from_numpy(clip).permute(3, 0, 1, 2).float()  # (C, T, H, W)
 
         clip_tensor = self.transform(clip_tensor)
         clip_tensor = clip_tensor.unsqueeze(0).to(self.device)  # (1, C, T, H, W)
 
         with torch.no_grad():
+            """print(
+                f"Clip tensor: shape={clip_tensor.shape}, "
+                f"min={clip_tensor.min().item():.3f}, "
+                f"max={clip_tensor.max().item():.3f}, "
+                f"mean={clip_tensor.mean().item():.3f}"
+            )
+            """
             outputs = self.model(clip_tensor)
+            print("Raw logits:", outputs.cpu().numpy())
             probs = torch.softmax(outputs, dim=1)
             conf, pred_idx = torch.max(probs, dim=1)
 
-        label = CLASS_NAMES[int(pred_idx.item())]
-        return label, float(conf.item())
+            label = CLASS_NAMES[int(pred_idx.item())]
+            return label, float(conf.item())
+
+
+           
 
 
 class ClipBuffer:
     """
     Rolling buffer of raw frames per tracked scene/person-group,
     used to accumulate enough frames before calling X3D.
+    Enhanced with motion-based frame selection for better accuracy.
     """
 
     def __init__(self, maxlen: int = 32):
         self.frames = deque(maxlen=maxlen)
+        self.motion_scores = deque(maxlen=maxlen)
 
     def add(self, frame: np.ndarray):
         self.frames.append(frame.copy())
+        # Calculate motion score (simple frame difference from previous)
+        if len(self.frames) > 1:
+            prev_frame = self.frames[-2]
+
+            if prev_frame.shape != frame.shape:
+                prev_frame = cv2.resize(
+                    prev_frame,
+                    (frame.shape[1], frame.shape[0])
+                )
+
+            motion = np.abs(
+                frame.astype(np.float32) -
+                prev_frame.astype(np.float32)
+            ).mean()
+            self.motion_scores.append(motion)
+        else:
+            self.motion_scores.append(0.0)
 
     def is_ready(self, min_frames: int = 13) -> bool:
         return len(self.frames) >= min_frames
 
     def get_clip(self) -> list[np.ndarray]:
-        return list(self.frames)
+        # Return motion-selected frames for better X3D input
+        if len(self.frames) <= 13:
+            return list(self.frames)
+        
+        # Select frames with highest motion (more likely to contain violence)
+        motion_array = np.array(self.motion_scores)
+        num_frames = 13
+        # Get indices of frames with highest motion
+        top_indices = np.argsort(motion_array)[-num_frames:]
+        top_indices = np.sort(top_indices)  # Keep temporal order
+        
+        return [self.frames[i] for i in top_indices]

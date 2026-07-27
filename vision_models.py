@@ -3,9 +3,7 @@
 Provides clean, typed boundaries around an ONNX-runtime YOLOX (object
 detection) and MMPose RTMPose (pose estimation) so that all application
 logic — ByteTrack tracking, kinematics, WebSocket streaming — stays fully
-independent of the underlying model framework. Object detection now
-runs directly on ONNX Runtime; no MMDetection/MMEngine dependency is
-required at inference time.
+independent of the underlying model framework.
 """
 
 from __future__ import annotations
@@ -89,19 +87,32 @@ class ObjectDetectionBatch:
 class RTMPosePipeline:
     """Top-down RTMPose pipeline backed by the MMPose inferencer.
 
-    The default MMPose ``human`` alias is RTMPose with an RTMDet human
-    detector. Config and checkpoint paths can be overridden with
-    environment variables or constructor arguments for offline deployments.
+    Two behavioral changes from the original version:
+
+    1. Frames are downscaled to ``max_frame_side`` before being sent to
+       the detector/pose models, then all output coordinates are rescaled
+       back to the original frame size. Running full-resolution CCTV
+       frames through detection + pose on every single frame is the
+       primary cause of slow inference; detection/pose accuracy is not
+       meaningfully hurt by working at ~960px on the long side.
+
+    2. Instance-level filtering uses the detector's own confidence score
+       (``det_thr``, passed to mmpose as ``bbox_thr``) instead of reusing
+       the keypoint-visibility threshold for both purposes. A partially
+       occluded person can be detected with high confidence while still
+       having several low-confidence keypoints — the old code could drop
+       that whole person because of the second, unrelated filter.
     """
 
     def __init__(
         self,
         pose_model: str = "human",
         pose_weights: Optional[str] = None,
-        det_model: str = "human",
+        det_model: Optional[str] = None,
         det_weights: Optional[str] = None,
         device: Optional[str] = None,
         det_cat_ids: Optional[Iterable[int]] = None,
+        max_frame_side: int = 960,
     ) -> None:
         try:
             from mmpose.apis import MMPoseInferencer
@@ -111,40 +122,72 @@ class RTMPosePipeline:
                 "Install the OpenMMLab dependencies from requirements.txt."
             ) from exc
 
-        self._inferencer = MMPoseInferencer(
-            pose2d=pose_model,
-            device=device,
-        )
+        # Leave det_model as None unless the caller explicitly overrides it.
+        # When None, mmpose auto-selects the matching default detector for
+        # whatever pose_model alias was given (this is how "human" works).
+        inferencer_kwargs = {"pose2d": pose_model, "device": device}
+        if det_model is not None:
+            inferencer_kwargs["det_model"] = det_model
+        if det_weights is not None:
+            inferencer_kwargs["det_weights"] = det_weights
+        if det_cat_ids is not None:
+            inferencer_kwargs["det_cat_ids"] = list(det_cat_ids)
+
+        self._inferencer = MMPoseInferencer(**inferencer_kwargs)
+        self._max_frame_side = max_frame_side
 
     @classmethod
     def from_env(cls) -> "RTMPosePipeline":
         return cls(
             pose_model=os.getenv("RTMPOSE_MODEL", "human"),
             pose_weights=os.getenv("RTMPOSE_WEIGHTS") or None,
-            det_model=os.getenv("RTMPOSE_DET_MODEL", "human"),
+            det_model=os.getenv("RTMPOSE_DET_MODEL") or None,
             det_weights=os.getenv("RTMPOSE_DET_WEIGHTS") or None,
             device=os.getenv("CV_DEVICE") or None,
+            max_frame_side=int(os.getenv("RTMPOSE_MAX_SIDE", "960")),
         )
 
     def predict(
-        self, 
-        frame: np.ndarray, 
-        confidence: float = 0.5,
+        self,
+        frame: np.ndarray,
+        confidence: float = 0.3,
+        det_thr: float = 0.3,
+        max_frame_side: Optional[int] = None,
         tracked_boxes: Optional[sv.Detections] = None,
     ) -> PoseDetectionBatch:
+        """
+        confidence: kept as the name for backward compatibility with
+            existing call sites — this is the per-keypoint visibility
+            threshold (mmpose's kpt_thr), NOT the detector confidence.
+        det_thr: the actual person-detection confidence gate (mmpose's
+            bbox_thr). This is what controls whether a person is found
+            in a crowded/occluded scene at all.
+        max_frame_side: override the instance default for this call only.
+        """
+        side_limit = self._max_frame_side if max_frame_side is None else max_frame_side
+        infer_frame, scale = _resize_for_inference(frame, side_limit) if side_limit and side_limit > 0 else (frame, 1.0)
+
         inferencer_kwargs = {
             "show": False,
             "return_vis": False,
             "kpt_thr": confidence,
+            "bbox_thr": det_thr,
         }
         if tracked_boxes is not None and len(tracked_boxes) > 0:
-            inferencer_kwargs["bboxes"] = tracked_boxes.xyxy.tolist()
+            # tracked_boxes are in ORIGINAL frame coordinates; scale them
+            # down to match infer_frame before handing them to mmpose.
+            scaled_boxes = tracked_boxes.xyxy * scale
+            inferencer_kwargs["bboxes"] = scaled_boxes.tolist()
 
-        result_generator = self._inferencer(frame, **inferencer_kwargs)
+        result_generator = self._inferencer(infer_frame, **inferencer_kwargs)
         result = next(result_generator)
         predictions = result.get("predictions", [])
         instances = predictions[0] if predictions else []
-        batch = _parse_pose_instances(instances, confidence)
+
+        batch = _parse_pose_instances(instances, det_thr)
+
+        if scale != 1.0:
+            batch = _rescale_batch(batch, 1.0 / scale)
 
         if tracked_boxes is not None and len(tracked_boxes) == len(batch):
             return PoseDetectionBatch(
@@ -160,12 +203,13 @@ class RTMPosePipeline:
 class YOLOXObjectDetector:
     """YOLOX detector wrapper for custom fire/weapon detection.
 
-    Runs YOLOX-s ONNX export via ONNX Runtime (TensorRT/CUDA). All
-    coordinate outputs are in xyxy pixel format. Class IDs follow the
-    project schema defined during training: 0=fire, 1=weapon.
+    Runs YOLOX-s ONNX export via ONNX Runtime. All coordinate outputs are
+    in xyxy pixel format. Class IDs follow the project schema defined
+    during training: 0=fire, 1=weapon.
 
-    If the ONNX model is not found, ``from_env`` returns ``None`` so
-    callers silently fall back to pose-only mode.
+    Unchanged from before — this class already letterboxes every frame
+    to a fixed 640x640 before inference, so it wasn't a speed or crowd-
+    detection bottleneck like the RTMPose path was.
     """
 
     def __init__(self, onnx_path: str, device: Optional[str] = None) -> None:
@@ -223,10 +267,8 @@ class YOLOXObjectDetector:
         )
         blob = letterboxed.astype(np.float32) / 255.0
         blob = blob.transpose(2, 0, 1)[np.newaxis, ...]
-
         ort_inputs = {self._input_name: blob}
         raw = self._session.run([self._output_name], ort_inputs)[0]
-
         return _decode_yolox_output(
             raw, scale, pad_left, pad_top, frame.shape[:2], confidence
         )
@@ -245,7 +287,43 @@ RTMDetObjectDetector = YOLOXObjectDetector
 
 
 # ---------------------------------------------------------------------------
-# YOLOX ONNX helper: letterbox + output decoding
+# Frame resizing helpers (new)
+# ---------------------------------------------------------------------------
+
+def _resize_for_inference(frame: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    """Downscale frame so its longest side is at most max_side. Returns
+    (possibly resized frame, scale factor applied). scale is 1.0 if no
+    resize was needed."""
+    h, w = frame.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return frame, 1.0
+    scale = max_side / float(longest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    return resized, scale
+
+
+def _rescale_batch(batch: PoseDetectionBatch, factor: float) -> PoseDetectionBatch:
+    """Scale all coordinates in a PoseDetectionBatch by factor (used to map
+    inference-resolution coordinates back to original-frame coordinates)."""
+    if len(batch) == 0:
+        return batch
+    xyxy = (batch.xyxy * factor).astype(np.float32)
+    keypoints = batch.keypoints.copy()
+    keypoints[:, :, :2] *= factor
+    return PoseDetectionBatch(
+        xyxy=xyxy,
+        confidence=batch.confidence,
+        class_id=batch.class_id,
+        keypoints=keypoints.astype(np.float32),
+        tracker_id=batch.tracker_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# YOLOX ONNX helper: letterbox + output decoding (unchanged)
 # ---------------------------------------------------------------------------
 
 YOLOX_NUM_CLASSES = 2
@@ -387,13 +465,23 @@ def _nms(
     return np.array(keep, dtype=np.int32)
 
 
+# ---------------------------------------------------------------------------
+# Keypoint / bbox matching
+# ---------------------------------------------------------------------------
+
 def match_keypoints_to_bbox(
     pose_batch: PoseDetectionBatch,
     tracked_bbox: np.ndarray,
-    min_iou: float = 0.01,
+    min_iou: float = 0.3,
 ) -> Optional[np.ndarray]:
-    """Find the pose keypoints corresponding to a tracked bounding box."""
+    """Find the pose keypoints corresponding to a tracked bounding box.
 
+    min_iou set to 0.1 — in crowded, overlapping
+    scenes, near-zero IOU will happily match a track to whichever person's
+    box happens to overlap even slightly, silently mixing up whose wrist
+    or head is being fed into the violence heuristic. 0.3 requires a real,
+    substantial overlap before accepting a match.
+    """
     if len(pose_batch) == 0:
         return None
 
@@ -455,10 +543,16 @@ def draw_object_detections(frame: np.ndarray, detections: ObjectDetectionBatch) 
         )
 
 
+# ---------------------------------------------------------------------------
+# Pose instance parsing
+# ---------------------------------------------------------------------------
+
 def _parse_pose_instances(
     instances: list[dict],
     min_score: float,
 ) -> PoseDetectionBatch:
+    """min_score now represents the DETECTION confidence gate (det_thr),
+    not a mix of keypoint and instance filtering."""
     boxes: list[np.ndarray] = []
     scores: list[float] = []
     keypoints: list[np.ndarray] = []
