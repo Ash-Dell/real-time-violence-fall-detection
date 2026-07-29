@@ -27,6 +27,7 @@ class InteractionTrack:
 
         self.created_frame = frame_id
         self.last_seen_frame = frame_id
+        self.missing_frames = 0
 
         self.state = InteractionState.CREATED
 
@@ -47,10 +48,43 @@ class InteractionTrack:
 
     def update_roi(self):
 
-        x1 = min(p.bbox[0] for p in self.members)
-        y1 = min(p.bbox[1] for p in self.members)
-        x2 = max(p.bbox[2] for p in self.members)
-        y2 = max(p.bbox[3] for p in self.members)
+        all_x = []
+        all_y = []
+
+        for p in self.members:
+            if p.keypoints is not None:
+                for x, y, conf in p.keypoints:
+                    if conf >= 0.3:
+                        all_x.append(x)
+                        all_y.append(y)
+
+        if not all_x or not all_y:
+            # Fallback to bounding boxes if no valid keypoints
+            x1 = min(p.bbox[0] for p in self.members)
+            y1 = min(p.bbox[1] for p in self.members)
+            x2 = max(p.bbox[2] for p in self.members)
+            y2 = max(p.bbox[3] for p in self.members)
+        else:
+            x1 = min(all_x)
+            y1 = min(all_y)
+            x2 = max(all_x)
+            y2 = max(all_y)
+
+        # Adaptive padding based on interaction size
+        width = x2 - x1
+        height = y2 - y1
+
+        padding_x = int(width * 0.10)
+        padding_y = int(height * 0.10)
+
+        x1 -= padding_x
+        x2 += padding_x
+        y1 -= padding_y
+        y2 += padding_y
+
+        # Clamp to image boundaries (will be further clamped during crop)
+        x1 = max(0, x1)
+        y1 = max(0, y1)
 
         self.roi = (x1, y1, x2, y2)
 

@@ -59,3 +59,15 @@ results/
 eval_results_old_v1.csv
 eval_results.csv
 __init__.py
+
+debug_clip/
+
+debug_roi/
+RWF-2000-custom
+debug_clip.zip
+generate_custom_csv.py
+test_video_custom.py
+train_list_custom.csv
+train_model_custom.py
+val_list_custom.csv
+yolo_adapter.py

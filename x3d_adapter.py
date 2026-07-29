@@ -14,7 +14,7 @@ from pytorchvideo.transforms import UniformTemporalSubsample, ShortSideScale
 # ---------------------------
 NUM_FRAMES = 13
 CROP_SIZE = 160
-CHECKPOINT_PATH = "checkpoints/best_x3d_s.pth"
+CHECKPOINT_PATH = "checkpoints/best_x3d_s_v2_pretrained.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CLASS_NAMES = {0: "NonFight", 1: "Fight"}
@@ -31,12 +31,12 @@ class X3DViolenceDetector:
         self.device = device
 
         # Rebuild the same architecture used in training
-        model = torch.hub.load("facebookresearch/pytorchvideo", "x3d_s", pretrained=False)
+        model = torch.hub.load("facebookresearch/pytorchvideo", "x3d_s", pretrained=True)
         in_features = model.blocks[-1].proj.in_features
         model.blocks[-1].proj = nn.Linear(in_features, 2)
 
-        state_dict = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(state_dict)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
         model.to(device)
 
@@ -90,8 +90,13 @@ class X3DViolenceDetector:
             )
             """
             outputs = self.model(clip_tensor)
-            print("Raw logits:", outputs.cpu().numpy())
+            print("Output range:",
+                  outputs.min().item(),
+                  outputs.max().item())
+
+            print(outputs)
             probs = torch.softmax(outputs, dim=1)
+            print("Probabilities:", probs.cpu().numpy())
             conf, pred_idx = torch.max(probs, dim=1)
 
             label = CLASS_NAMES[int(pred_idx.item())]
@@ -139,6 +144,9 @@ class ClipBuffer:
         # Return motion-selected frames for better X3D input
         if len(self.frames) <= 13:
             return list(self.frames)
+        # TEMPORARY: use the latest 13 consecutive frames
+        return list(self.frames)[-13:]
+
         
         # Select frames with highest motion (more likely to contain violence)
         motion_array = np.array(self.motion_scores)
@@ -147,4 +155,4 @@ class ClipBuffer:
         top_indices = np.argsort(motion_array)[-num_frames:]
         top_indices = np.sort(top_indices)  # Keep temporal order
         
-        return [self.frames[i] for i in top_indices]
+        return list(self.frames)[-13:]

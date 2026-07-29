@@ -10,7 +10,7 @@ from vision_models import create_pose_pipeline, match_keypoints_to_bbox
 from x3d_adapter import X3DViolenceDetector, ClipBuffer
 from pathlib import Path
 from datetime import datetime
-from interaction_manager.interaction_manager import InteractionManager
+from interaction_manager.local_interaction_proposer import LocalInteractionProposer
 from interaction_manager.person_node import PersonNode
 from tracking_utils import (
     update_track_state,
@@ -179,7 +179,7 @@ def run_on_video(path, pose_model, x3d_detector):
     x3d_label, x3d_confidence = "N/A", 0.0
     x3d_confidence_history = deque(maxlen=5)  # For confidence smoothing
     track_states = {}
-    interaction_manager = InteractionManager()
+    interaction_manager = LocalInteractionProposer()
 
     while True:
         ret, frame = cap.read()
@@ -189,14 +189,58 @@ def run_on_video(path, pose_model, x3d_detector):
 
         pose_results = pose_model.predict(frame, confidence=POSE_DETECTION_CONFIDENCE, det_thr=POSE_DETECTION_CONFIDENCE)
         detections = pose_results.to_supervision()
-        print(f"Pose detections: {len(detections)}")
-        print("Detection confidences:", detections.confidence)
-        print("Class IDs:", detections.class_id)
-        print("Boxes:", len(detections.xyxy))
-        print("Confidences:", len(detections.confidence))
         tracked = byte_tracker.update_with_detections(detections)
-        print(detections)
-        print(f"Tracked people: {len(tracked)}")
+        print("\n================ TRACKER =================")
+        print(f"Frame {frame_id}")
+
+        if len(tracked) == 0:
+            print("No tracked people")
+        else:
+            print(f"Tracked persons: {len(tracked)}")
+
+            for i in range(len(tracked)):
+                tid = int(tracked.tracker_id[i])
+                box = tracked.xyxy[i]
+
+                print(
+                    f"ID={tid:3d} | "
+                    f"({int(box[0])},{int(box[1])}) -> "
+                    f"({int(box[2])},{int(box[3])})"
+                )
+        # ==========================================================
+        # STAGE 1 : POSE DEBUG
+        # ==========================================================
+
+        print(f"\n{'='*60}")
+        print(f"FRAME {frame_id}")
+
+        print(f"Pose detections : {len(detections)}")
+
+        if detections.confidence is not None:
+            print(
+                "Detection confidences:",
+                [round(float(c), 3) for c in detections.confidence]
+            )
+
+        if len(detections.xyxy) > 0:
+            print("Bounding Boxes:")
+
+            for i, box in enumerate(detections.xyxy):
+                x1, y1, x2, y2 = map(int, box)
+
+                conf = (
+                    float(detections.confidence[i])
+                    if detections.confidence is not None
+                    else -1
+                )
+
+                print(
+                    f"  Person {i+1}: "
+                    f"Conf={conf:.3f} "
+                    f"Box=({x1},{y1}) ({x2},{y2})"
+                )
+        else:
+            print("NO PERSONS DETECTED")
 
         tracked_people = []
         active_ids = set()
@@ -260,9 +304,11 @@ def run_on_video(path, pose_model, x3d_detector):
             }
         interaction_tracks = interaction_manager.update(
             tracked_people,
-            int(cap.get(cv2.CAP_PROP_POS_FRAMES)),
+            frame_id,
             frame
         )
+
+
         if frame_id % 30 == 0:
             print(f"\nFrame {frame_id}")
             print(f"Interaction tracks: {len(interaction_tracks)}")
@@ -296,6 +342,28 @@ def run_on_video(path, pose_model, x3d_detector):
                     )
                 except Exception as e:
                     print(f"X3D ERROR: {e}")
+
+        for interaction in interaction_tracks:
+            x1, y1, x2, y2 = map(int, interaction.roi)
+            color = (0, 255, 0)
+            if interaction.is_violent():
+                color = (0, 0, 255)
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                color,
+                2
+            )
+            cv2.putText(
+                frame,
+                f"I{interaction.interaction_id}",
+                (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2
+            )
 
 
 

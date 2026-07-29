@@ -1,6 +1,7 @@
 from typing import Dict
 
 import numpy as np
+import cv2
 
 from .association_graph import AssociationGraph
 from .interaction_track import InteractionTrack
@@ -91,7 +92,17 @@ class InteractionManager:
                     - np.array(people[j].centroid)
                 ) < PROXIMITY_THRESHOLD:
 
-                    self.graph.add_edge(people[i], people[j])
+                    distance = np.linalg.norm(
+                        np.array(people[i].centroid) -
+                        np.array(people[j].centroid)
+                    )
+
+                    if distance < PROXIMITY_THRESHOLD:
+                        print(
+                            f"{people[i].tracker_id} <-> {people[j].tracker_id} "
+                            f"distance={distance:.1f}"
+                        )
+                        self.graph.add_edge(people[i], people[j])
 
     def _member_ids(self, members):
         return {person.tracker_id for person in members}
@@ -126,6 +137,11 @@ class InteractionManager:
                     members=members,
                     frame_id=frame_id,
                 )
+                print(
+                    f"[MATCH] Interaction {matched.interaction_id} | "
+                    f"Members: {sorted(member_ids)} | "
+                    f"Overlap: {best_overlap}"
+                )
 
                 x1, y1, x2, y2 = map(int, matched.roi)
 
@@ -142,6 +158,11 @@ class InteractionManager:
 
                 matched.add_frame(crop)
 
+                cv2.imwrite(
+                    f"debug_roi/frame_{frame_id}_interaction_{matched.interaction_id}.jpg",
+                    crop
+                )
+
                 updated[matched.interaction_id] = matched
 
             else:
@@ -150,6 +171,10 @@ class InteractionManager:
                     interaction_id=self.next_interaction_id,
                     members=members,
                     frame_id=frame_id,
+                )
+                print(
+                    f"[NEW] Interaction {self.next_interaction_id} | "
+                    f"Members: {sorted(member_ids)}"
                 )
 
                 x1, y1, x2, y2 = map(int, interaction.roi)
@@ -167,6 +192,10 @@ class InteractionManager:
 
                 interaction.add_frame(crop)
                 # interaction.add_frame(self.current_frame)
+                cv2.imwrite(
+                    f"debug_roi/frame_{frame_id}_interaction_{interaction.interaction_id}.jpg",
+                    crop
+                )
 
                 updated[self.next_interaction_id] = interaction
                 self.next_interaction_id += 1
